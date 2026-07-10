@@ -190,4 +190,16 @@ mixOmics::network(final.spls.liver, comp = 1:2, alpha.node = 1, cutoff = 0, # on
         save = 'png', # save as a png to the current working directory
         name.save = 'sPLS Liver Toxicity Case Study Network Plot')
 
-cim(final.spls.liver, comp = 1:2, xlab = "\nclinic", ylab = "genes", title = "Cluster Image Map of Liver Genes with Liver clinical data", row.cex = 1.2, col.cex = 1.2)
+cim(final.spls.liver, comp = 1:2, xlab = "\nclinic", ylab = "genes", title = "Cluster Image Map of Liver Genes with Liver clinical data", row.cex = 1.2, col.cex = 1.2, center = TRUE, scale = TRUE, save = "pdf")
+
+cim(
+  final.spls.liver, color = color.edge,
+  comp = 1:2,
+  title = "Cluster Image Map of Liver Genes with Liver Clinical Data",
+  xlab = "\n\nClinical variables",
+  ylab = "Genes",
+  margins = c(9, 9),      # <- much larger
+  row.cex = 1.2,
+  col.cex = 1.1
+)
+    
