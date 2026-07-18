@@ -1,0 +1,468 @@
+---
+title: "Multi-Omics Integration Analysis - MOFA"
+author: "Adam El Idrissi"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+# Practical overview
+
+This R Markdown document preserves the workflow and execution order of the supplied MOFA.R script, applied in the same dataset we analysed previously. This document contains detailed descriptions of the code cells and the resulting outputs in relation to the dataset used in this practical. It provides an overview of the multi-omics integration process performed using `Multi-Omics Factor Analysis (MOFA)`. The official MOFA2 tutorials, available at `https://biofam.github.io/MOFA2/tutorials.html`, which provides additional examples of model training and downstream analysis.
+
+MOFA utilizes Matrix Factorization framework for the unsupervised integration of multiple omics datasets. It learns an interpretable, low-dimensional representation of the integrated data through a set of latent factors. These factors capture the major sources of variation across the analysed omics modalities and can subsequently be examined in relation to sample groups, biological characteristics, and influential molecular features.
+
+------------------------------------------------------------------------
+
+# 1. Package installation and loading
+
+<!-- Add your comments here. -->
+
+```{r package-loading}
+
+
+########## MOFA ################################################################
+
+## Load all the required libraries 
+# BiocManager::install("MOFA2")
+
+
+library(MOFA2)
+library(data.table)
+library(ggplot2)
+library(dplyr)
+library(psych)
+library(GGally)
+library(ggplot2)
+library(ggpubr)
+library(tidyr)
+library(basilisk)
+library(edgeR)
+
+```
+
+------------------------------------------------------------------------
+
+# 2. Load the RNA-seq, methylation, and metadata files
+
+<!-- Add your comments here. -->
+
+```{r data-import}
+##### load all the required files and arrange the files for MOFA Analysis
+RNA_Seq_Data=read.csv("RNA_Seq_Liver.csv", row.names = 1)
+head(RNA_Seq_Data)[1:5]
+
+
+Methylation=read.csv("Epigenetic_matrix_filtered_100000.csv", row.names = 1)
+rownames(Methylation)=Methylation$region
+Methylation$X=NULL
+Methylation$region =NULL
+
+head(Methylation)
+
+metadat_columns=read.csv("Metadata.csv")
+head(metadat_columns)
+metadat_columns$X=NULL
+
+```
+
+------------------------------------------------------------------------
+
+# 3. Metadata filtering and sample alignment
+
+<!-- Add your comments here. -->
+
+```{r metadata-filtering}
+###################### Metadata Filtering ######################################
+# Add prefix based on boar taint group
+metadat_columns$SampleName <- ifelse(
+  grepl("high", metadat_columns$Group, ignore.case = TRUE), 
+  paste0("H", metadat_columns$SampleID),
+  ifelse(
+    grepl("medium", metadat_columns$Group, ignore.case = TRUE), 
+    paste0("M", metadat_columns$SampleID),
+    ifelse(
+      grepl("low", metadat_columns$Group, ignore.case = TRUE), 
+      paste0("L", metadat_columns$SampleID),
+      paste0("X", metadat_columns$SampleID)  # fallback if none match
+    )
+  )
+)
+metadat_columns$Group <- sub(" .*", "", metadat_columns$Group)
+
+
+
+# Create the old and new column name mapping
+metadat_columns$OldSampleName <- paste0("X", metadat_columns$SampleID)  # Original names
+name_map <- setNames(metadat_columns$SampleName, metadat_columns$OldSampleName)  # Named vector: old -> new
+# Rename methylation matrix columns
+common_meth_cols <- intersect(colnames(Methylation), names(name_map))
+colnames(Methylation)[match(common_meth_cols, colnames(Methylation))] <- name_map[common_meth_cols]
+# Rename RNA-seq matrix columns
+common_rna_cols <- intersect(colnames(RNA_Seq_Data), names(name_map))
+colnames(RNA_Seq_Data)[match(common_rna_cols, colnames(RNA_Seq_Data))] <- name_map[common_rna_cols]
+# Update metadata rownames to match new names
+rownames(metadat_columns) <- metadat_columns$SampleName
+# Filter metadata to keep only samples present in your omics data
+omics_samples <- colnames(Methylation)  
+sample_metadata <- metadat_columns[metadat_columns$SampleName %in% omics_samples, ]
+
+
+# Double-check that sample orders match
+all(colnames(RNA_Seq_Data) == colnames(Methylation))
+# Reorder columns of methylation matrix to match RNA-seq
+meth_matrix <- Methylation[, colnames(RNA_Seq_Data)]
+####### Check that they're now aligned
+all(colnames(meth_matrix) == colnames(RNA_Seq_Data))  # should return TRUE
+
+## Change the colnames of metadata
+colnames(sample_metadata)[colnames(sample_metadata) == "SampleName"] <- "sample"
+colnames(sample_metadata)[colnames(sample_metadata) == "Group"] <- "group"
+
+```
+
+------------------------------------------------------------------------
+
+# 4. Normalize and filter the RNA-seq data
+
+<!-- Add your comments here. -->
+
+```{r rna-normalization}
+########### Normalize and filter for downstream analysis #######################
+
+# Create DGEList object
+dge <- DGEList(counts = RNA_Seq_Data)
+keep <- filterByExpr(dge)  
+dge <- dge[keep, , keep.lib.sizes=FALSE]
+# Normalize with TMM
+dge <- calcNormFactors(dge)
+# Log2-CPM transformation
+log_RNA <- cpm(dge, log = TRUE, prior.count = 1)
+# Filter top 3000 most variable genes
+gene_var <- apply(log_RNA, 1, var)
+top_genes <- names(sort(gene_var, decreasing = TRUE))[1:3000]
+log_RNA_filtered <- log_RNA[top_genes, ]
+
+
+```
+
+------------------------------------------------------------------------
+
+# 5. Transform and filter the methylation data
+
+<!-- Add your comments here. -->
+
+```{r methylation-filtering}
+### Methylation data
+# Ensure beta values are in [0, 1]
+Methylation[Methylation <= 0] <- 0
+Methylation[Methylation >= 1] <- 1 
+summary(Methylation)
+# Convert data frame to numeric matrix
+Methylation <- as.matrix(Methylation)
+summary(Methylation)
+storage.mode(Methylation) <- "numeric"  # make sure all values are numeric
+# Convert to M-values
+Mval <- log2(Methylation / (1 - Methylation))
+# Replace Inf and -Inf with NA safely
+Mval[is.infinite(Mval)] <- NA
+class(Mval)
+# keep features with <20% NA
+clean_meth <- Mval[apply(Mval, 1, function(x) sum(is.na(x)) < length(x) * 0.2), ]  
+clean_meth <- clean_meth[, colSums(is.na(clean_meth)) < nrow(clean_meth) * 0.2]
+
+# Calculate variance per CpG (row), ignoring NAs
+var_per_cpg <- apply(clean_meth, 1, var, na.rm = TRUE)
+# Sort CpGs by variance decreasing and get top 5000 CpGs
+top_CPGs <- names(sort(var_per_cpg, decreasing = TRUE))[1:5000]
+# Subset methylation data to top variable CpGs
+Meth_view <- clean_meth[top_CPGs, ]
+# Check dimensions
+dim(Meth_view)
+# Confirm shared sample names
+common_samples <- intersect(colnames(log_RNA_filtered), colnames(Meth_view))
+
+
+
+```
+
+------------------------------------------------------------------------
+
+# 6. Prepare the multi-omics data views
+
+<!-- Add your comments here. -->
+
+```{r multi-omics-data}
+# Subset and reorder both datasets to same sample order
+RNA_view <- log_RNA_filtered[, common_samples]
+Meth_view <- Meth_view[, common_samples]
+
+
+
+# Build multi-omics data list (9 sample names in columns, rows have RNASeq in one object, 
+# similarly in a separate object another list with the CpG data)- They are NOT merged in a single object or data frame.
+multi_omics_data <- list(
+  RNAseq = as.matrix(RNA_view),
+  Methylation = as.matrix(Meth_view)
+)
+
+
+```
+
+------------------------------------------------------------------------
+
+# 7. Create, prepare, and train the MOFA model
+
+<!-- Add your comments here. -->
+
+```{r mofa-training}
+# Create MOFA object with groups specified explicitly - it now access the list 
+mofa_object <- create_mofa(multi_omics_data, groups = sample_metadata$group)
+plot_data_overview(mofa_object)
+
+# Prepare options
+data_opts <- get_default_data_options(mofa_object)
+model_opts <- get_default_model_options(mofa_object)
+train_opts <- get_default_training_options(mofa_object)
+train_opts$seed <- 42  # for reproducibility
+train_opts$maxiter <- 1000
+model_opts$num_factors <- 2
+
+# Prepare the model (NO samples_metadata or groups arguments here)
+mofa_object <- prepare_mofa(
+  object = mofa_object,
+  data_options = data_opts,
+  model_options = model_opts,
+  training_options = train_opts
+)
+
+# Run MOFA
+outfile = file.path(getwd(),"model.hdf5")
+mofa_trained <- run_mofa(mofa_object,outfile, use_basilisk = TRUE)
+
+```
+
+------------------------------------------------------------------------
+
+# 8. Inspect variance explained by the trained model
+
+<!-- Add your comments here. -->
+
+```{r variance-explained}
+# -----------------------------------
+# Downstream Analysis & Visualization
+# -----------------------------------
+
+### Check the Number of features according to groups
+plot_data_overview(mofa_trained)
+# Total variance explained per Omics 
+print(mofa_trained@cache$variance_explained$r2_total[[1]])
+# Variance explained by each factor per view 
+head(mofa_trained@cache$variance_explained$r2_per_factor[[1]])
+###Plot variance 
+plot_variance_explained(mofa_trained, x="view", y="factor")
+plot_variance_explained(mofa_trained, x="group", y="factor", plot_total = T)[[2]]
+
+
+```
+
+------------------------------------------------------------------------
+
+# 9. Plot the MOFA factors by group
+
+<!-- Add your comments here. -->
+
+```{r factor-plot}
+plot_factor(mofa_trained, 
+                 factors = c(1,2),
+                 color_by = "group",
+                 dot_size = 3,        # change dot size
+                 dodge = T,           # dodge points with different colors
+                 legend = T,         
+                 add_violin = T,      
+                 violin_alpha = 0.25)
+
+
+
+
+```
+
+------------------------------------------------------------------------
+
+# 10. Plot Factor 1 against Factor 2
+
+<!-- Add your comments here. -->
+
+```{r factor-scatter}
+# factors scatter plot
+# Convert long to wide format
+factors_df <- get_factors(mofa_trained, factors = "all", as.data.frame = TRUE)
+
+factors_wide <- factors_df %>%
+  pivot_wider(names_from = factor, values_from = value)
+
+# Scatter plot
+ggplot(factors_wide, aes(x = Factor1, y = Factor2, color = group)) +
+  geom_point(size = 3) +
+  geom_text(aes(label = sample), vjust = -0.5, hjust = 0.5, size = 3) +  # sample labels above points
+  theme_minimal() +
+  labs(title = "MOFA Factor 1 vs Factor 2 by Group", color = "Group")
+
+
+
+```
+
+------------------------------------------------------------------------
+
+# 11. Inspect RNA-seq feature weights
+
+<!-- Add your comments here. -->
+
+```{r rna-feature-weights}
+################
+
+# Identify Important Genes/CpGs for Each Factor
+plot_weights(mofa_trained,
+             view = "RNAseq",
+             factor = 1,
+             nfeatures = 10,     # Number of features to highlight
+             scale = T,          
+             abs = F             # Take the absolute value?
+)
+
+# Plot top absolute weights (most influential features regardless of direction)
+plot_top_weights(mofa_trained,
+                 view = "RNAseq",
+                 factor = 1,
+                 nfeatures = 10
+)
+
+
+```
+
+------------------------------------------------------------------------
+
+# 12. Inspect methylation feature weights
+
+<!-- Add your comments here. -->
+
+```{r methylation-feature-weights}
+#### Methylation 
+# Plot feature weights for Factor 1 in the Methylation view
+plot_weights(mofa_trained,
+             view = "Methylation",
+             factor = 1,
+             nfeatures = 10,     # Number of features to highlight
+             scale = T,          # Scale weights from -1 to 1
+             abs = F             # Take the absolute value?
+)
+
+# Plot top absolute weights (most influential features regardless of direction)
+plot_top_weights(mofa_trained,
+                 view = "Methylation",
+                 factor = 1,
+                 nfeatures = 10
+)
+
+
+```
+
+------------------------------------------------------------------------
+
+# 13. Relate the top RNA-seq feature to Factor 1
+
+<!-- Add your comments here. -->
+
+```{r factor-feature-correlation}
+#######  Gene correlates with factor 1 component ###############################
+
+# Extract weights
+weights <- get_weights(mofa_trained, views = "RNAseq", factors = 1, as.data.frame = TRUE)
+#These weights represent how strongly each feature contributes to Factor 1
+
+top_genes <- get_weights(mofa_trained, 
+                         view = "RNAseq", 
+                         factor = 1, 
+                         as.data.frame = TRUE)
+
+top_feature <- top_genes[order(abs(top_genes$value), decreasing = TRUE), ]
+top_feature <- weights[order(-abs(weights$value)), "feature"][1]
+head(top_feature)
+# Extract factor scores
+factors <- get_factors(mofa_trained, factors = 1, as.data.frame = TRUE)
+
+# Extract feature expression
+data <- get_data(mofa_trained, view = "RNAseq", as.data.frame = TRUE)
+feature_data <- subset(data, as.character(feature) == as.character(top_feature))
+
+# Merge data
+df <- merge(factors, feature_data, by = "sample")
+df$group <- samples_metadata(mofa_trained)$group
+
+# Plot 
+ggplot(df, aes(x = value.x, y = value.y, color = group)) +
+  geom_point(size = 3) +
+  geom_smooth(method = "lm", se = FALSE) +
+  stat_cor(method = "pearson") +
+  labs(
+    x = "Factor 1 score",
+    y = paste("Expression of", top_feature)
+  ) +
+  theme_minimal()
+
+
+
+```
+
+------------------------------------------------------------------------
+
+# 14. Visualize the top features driving Factor 1
+
+<!-- Add your comments here. -->
+
+```{r top-factor-features}
+# Visualization of Top 30 Features Driving Latent Factor 1 in MOFA (RNA-Seq and Methylation)
+# Get latent factors (samples × factors)
+factors <- get_factors(mofa_trained, factors = "all")
+
+# Get feature weights for all views (features × factors)
+weights <- get_weights(mofa_trained, views = c("RNAseq", "Methylation"), factors = 1)
+
+# Top 30 genes with highest absolute weights in RNAseq
+top_genes <- sort(abs(weights$RNAseq[,1]), decreasing = TRUE)[1:30]
+top_genes_names <- names(top_genes)
+
+# Top 30 CpGs with highest absolute weights in Methylation
+top_cpgs <- sort(abs(weights$Methylation[,1]), decreasing = TRUE)[1:30]
+top_cpgs_names <- names(top_cpgs)
+
+# Get input data (long format)
+data <- get_data(mofa_trained, as.data.frame = TRUE)
+
+# Subset data for top features
+top_gene_data <- subset(data, feature %in% top_genes_names & view == "RNAseq")
+top_cpg_data <- subset(data, feature %in% top_cpgs_names & view == "Methylation")
+
+
+# Plot Genes
+ggplot(top_gene_data, aes(x = group, y = value, fill = group)) +
+  geom_violin(alpha = 0.3) +
+  geom_jitter(width = 0.2, size = 1) +
+  facet_wrap(~ feature, scales = "free_y") +
+  theme_minimal() +
+  labs(title = "Top 30 Genes by MOFA Factor 1",
+       y = "Expression", x = "Boar Taint Group")
+
+##### For CPGs 
+ggplot(top_cpg_data, aes(x = group, y = value, fill = group)) +
+  geom_violin(alpha = 0.3) +
+  geom_jitter(width = 0.2, size = 1) +
+  facet_wrap(~ feature, scales = "free_y") +
+  theme_minimal() +
+  labs(title = "Top 30 CPGs by MOFA Factor 1",
+       y = "Expression", x = "Boar Taint Group")
+
+```
