@@ -1,6 +1,6 @@
 ---
 title: "Multi-Omics Integration Analysis - MOFA"
-author: "Github Profile: x-Ghosts"
+author: "Adam El Idrissi"
 date: "`r Sys.Date()`"
 output:
   html_document:
@@ -19,7 +19,7 @@ MOFA utilizes Matrix Factorization framework for the unsupervised integration of
 
 # 1. Package installation and loading
 
-<!-- Add your comments here. -->
+The required packages are obtained from both CRAN and Bioconductor repositories, with `MOFA2` installed through `BiocManager`. `MOFA2` is the main package used for multi-omics integration in this practical. `basilisk` is used to manage the Python environment and dependencies required by the MOFA2 implementation. In this workflow, this environment is accessed explicitly when the model is trained using `run_mofa(..., use_basilisk = TRUE)`. The stable Bioconductor installation of MOFA2 uses `basilisk` to configure the required Python environment automatically. `edgeR` is used to process the RNA-seq count matrix before integration. `data.table`, `dplyr`, and `tidyr` are loaded for dataframes manipulation.
 
 ```{r package-loading}
 
@@ -48,7 +48,9 @@ library(edgeR)
 
 # 2. Load the RNA-seq, methylation, and metadata files
 
-<!-- Add your comments here. -->
+Boar taint is one of the most extensively studied phenotypes in swine production. It is characterized by an unpleasant urine- or feces-like odor and flavour that is released during the cooking of meat from uncastrated male pigs. Based on the intensity of this phenotype, the animals included in this study were classified into three groups: Low, Medium, and High boar taint.
+
+Our two datasets originate from the 3 groups of boars, differentiated by their taints (Low - Medium - High taint), where one dataset contains Liver RNA-seq measurements and the other contains Methylation measurements. The RNA matrix consists of 75,375 genes measured across 9 boars (3 from each phenotypes), whereas the methylation matrix contains 100,000 methylation observations measured from the same 9 boars (3 from each phenotypes). For vertical integration using the MOFA framework, it is essential that the same biological samples are shared across all omics modalities. In our case, the nine boars were profiled at different molecular levels, allowing the integration of transcriptomic and methylation information from the same individuals.
 
 ```{r data-import}
 ##### load all the required files and arrange the files for MOFA Analysis
@@ -73,7 +75,7 @@ metadat_columns$X=NULL
 
 # 3. Metadata filtering and sample alignment
 
-<!-- Add your comments here. -->
+The metadata file contains the identifiers of each boar together with its corresponding boar taint phenotype (Low, Medium, or High). In this step, the metadata are prepared to be compatible with the MOFA integration framework. One important concept during multi-omics integration is `shared samples measurements`. This means that the samples measurements from the individuals must be compatible across all other modalities. For example, if Dataset A contains the samples identifiers as ID1, ID2, ID3, then Dataset B and Dataset C must also contain the same identifier (ID1, ID2, ID3). Any mismatch in the sample naming would result in non-functioning data fusion, and consequently biasing the results outcome.
 
 ```{r metadata-filtering}
 ###################### Metadata Filtering ######################################
@@ -128,7 +130,7 @@ colnames(sample_metadata)[colnames(sample_metadata) == "Group"] <- "group"
 
 # 4. Normalize and filter the RNA-seq data
 
-<!-- Add your comments here. -->
+Before integrating the transcriptomic data with any other data modality, the RNA-seq counts must be normalized to create a stable distribution. The raw count matrix are initially pre-processed by removing lowly expressed genes using `filterByExpr()`. Normalization factors are then estimated with `calcNormFactors()` for batch to batch estimation and false positive/negative results, and the counts are transformed into log<sub>2</sub> Counts Per Million (CPM) values using a prior count to avoid undefined values produced by log(0) (mathematically undefined real number). The final processed RNA-seq data leaves with 9 boars and the top 5000 most variable genes.
 
 ```{r rna-normalization}
 ########### Normalize and filter for downstream analysis #######################
@@ -143,9 +145,11 @@ dge <- calcNormFactors(dge)
 log_RNA <- cpm(dge, log = TRUE, prior.count = 1)
 # Filter top 3000 most variable genes
 gene_var <- apply(log_RNA, 1, var)
-top_genes <- names(sort(gene_var, decreasing = TRUE))[1:3000]
+top_genes <- names(sort(gene_var, decreasing = TRUE))[1:5000]
 log_RNA_filtered <- log_RNA[top_genes, ]
 
+dim(gene_var)
+dim(log_RNA_filtered)
 
 ```
 
@@ -153,7 +157,7 @@ log_RNA_filtered <- log_RNA[top_genes, ]
 
 # 5. Transform and filter the methylation data
 
-<!-- Add your comments here. -->
+Before integrating the methylation data with any other data modalities, in the same process of RNA-seq, methylation data is subject to pre-processing. The data are first converted into a numeric matrix, after which the methylation β-values are transformed into M-values using a logit transformatiion. This transformation is presented as log2 ratio transformation of the intensities methylated probes vs unmethylated probes. The reference of this transformation is in the following paper `https://pmc.ncbi.nlm.nih.gov/articles/PMC3012676/`. To improve data quality, methylation sites with more than 20% missing values are removed, and samples exceeding the same missingness threshold are also excluded. The final outcome of the methylation dataset is 5000 methylated regions in 9 candidate boars.
 
 ```{r methylation-filtering}
 ### Methylation data
@@ -193,7 +197,11 @@ common_samples <- intersect(colnames(log_RNA_filtered), colnames(Meth_view))
 
 # 6. Prepare the multi-omics data views
 
-<!-- Add your comments here. -->
+Before constructing the MOFA model, the RNA-seq and methylation datasets must contain the same biological samples in the same column order. The object common_samples, defined in the previous step, contains the sample identifiers shared by both omics datasets. The RNA-seq matrix is therefore subset using log_RNA_filtered[, common_samples], while the methylation matrix is subset using Meth_view[, common_samples]. This operation has two purposes. First, it removes any sample that is not present in both datasets. Second, it ensures that corresponding columns in the two matrices refer to the same biological individual. For example, the first column of RNA_view and the first column of Meth_view must represent the same sample. This alignment is essential because MOFA integrates information measured across the same set of samples.
+
+The two processed datasets are then stored in the named list multi_omics_data. Each element of this list represents a separate omics view: - RNAseq contains the filtered and normalized RNA-seq data. - Methylation contains the filtered methylation M-values.
+
+The function as.matrix() converts each object into a numeric matrix before it is supplied to MOFA. In both matrices, rows represent molecular features and columns represent samples. The RNA-seq matrix therefore contains genes in rows, whereas the methylation matrix contains CpG regions or methylation features in rows. It is important to note that the datasets are not merged into a single dataframe. Instead, they remain as separate matrices within the same list. This preserves the identity of each omics modality and allows MOFA to model variation within and across the RNA-seq and methylation views.
 
 ```{r multi-omics-data}
 # Subset and reorder both datasets to same sample order
@@ -209,6 +217,9 @@ multi_omics_data <- list(
   Methylation = as.matrix(Meth_view)
 )
 
+head(multi_omics_data$RNAseq)
+head(multi_omics_data$Methylation)
+
 
 ```
 
@@ -216,7 +227,13 @@ multi_omics_data <- list(
 
 # 7. Create, prepare, and train the MOFA model
 
-<!-- Add your comments here. -->
+## Construction and training of the MOFA model
+
+The two aligned omics views are used to construct the initial MOFA object with `create_mofa()`. The resulting object contains the RNA-seq and methylation matrices together with the sample-group assignments supplied through `groups = sample_metadata$group`. At this stage, the model has not yet been trained; the function only organizes the input data into the structure required by MOFA2. The `plot_data_overview()` function provides a visual summary of the input structure. It provides the number of datasets that we're currently willing to train, the sample numbers, MOFA is an unsupervised factor-analysis framework. It aims to represent the integrated datasets using a smaller number of latent factors. Each factor captures a source of variation that may be specific to one omics view or shared across multiple views. In this practical, the factors are inferred jointly from the RNA-seq and methylation data rather than being constructed to predict the Low, Medium, and High boar-taint classes.
+
+The parameter `model_opts$num_factors <- 3` requests the estimation of three latent factors. These factors provide three independent dimensions through which the principal patterns of variability in the RNA-seq and methylation datasets can be summarized. The number of factors is specified before training and should be interpreted in relation to the amount of variance explained by each factor during downstream analysis. The MOFA documentation states that there is no universally optimal number of factors because the appropriate choice depends on the objective, dimensions, and complexity of the analysis.
+
+The `prepare_mofa()` function combines the selected data, model, and training options with the initial MOFA object. This preparation step checks and configures the object before model fitting. The sample metadata and groups are not supplied again because they were already incorporated when `create_mofa()` was called. Finally, `run_mofa()` trains the prepared model. The output file path is defined as `model.hdf5` within the current working directory. The HDF5 file stores the trained model and its learned parameters. Setting `use_basilisk = TRUE` instructs MOFA2 to use the Python environment managed through `basilisk`. For a clearer understanding of the integration, we invite you to look at the general framework in: `https://biofam.github.io/MOFA2/`.
 
 ```{r mofa-training}
 # Create MOFA object with groups specified explicitly - it now access the list 
@@ -229,7 +246,7 @@ model_opts <- get_default_model_options(mofa_object)
 train_opts <- get_default_training_options(mofa_object)
 train_opts$seed <- 42  # for reproducibility
 train_opts$maxiter <- 1000
-model_opts$num_factors <- 2
+model_opts$num_factors <- 3
 
 # Prepare the model (NO samples_metadata or groups arguments here)
 mofa_object <- prepare_mofa(
@@ -249,7 +266,7 @@ mofa_trained <- run_mofa(mofa_object,outfile, use_basilisk = TRUE)
 
 # 8. Inspect variance explained by the trained model
 
-<!-- Add your comments here. -->
+The first step in the MOFA analysis is to quantify the amount of variance explained (R2) by each factor in each data modality. The variance explained estimates are stored in the hdf5 file and loaded in `mofa_trained@cache$variance_explained$r2_per_factor[[1]]`. As observed, RNA-seq liver data has an important cumulative variance explained of 52 % and methylation data of 32.43 % among the three observed factors. We will inspect in the future cells the biomarkers driven by the Views (Modalities) across groups differentiation.
 
 ```{r variance-explained}
 # -----------------------------------
@@ -263,8 +280,8 @@ print(mofa_trained@cache$variance_explained$r2_total[[1]])
 # Variance explained by each factor per view 
 head(mofa_trained@cache$variance_explained$r2_per_factor[[1]])
 ###Plot variance 
-plot_variance_explained(mofa_trained, x="view", y="factor")
-plot_variance_explained(mofa_trained, x="group", y="factor", plot_total = T)[[2]]
+plot_variance_explained(mofa_trained, x="view", y="factor") # Modality
+plot_variance_explained(mofa_trained, x="group", y="factor", plot_total = T)[[2]] # Group
 
 
 ```
@@ -284,7 +301,6 @@ plot_factor(mofa_trained,
                  legend = T,         
                  add_violin = T,      
                  violin_alpha = 0.25)
-
 
 
 
@@ -372,7 +388,7 @@ plot_top_weights(mofa_trained,
 
 ------------------------------------------------------------------------
 
-# 13. Relate the top RNA-seq feature to Factor 1
+# 13. Relate the top RNA-seq feature to Factor 1 and Factor 2
 
 <!-- Add your comments here. -->
 
@@ -393,6 +409,47 @@ top_feature <- weights[order(-abs(weights$value)), "feature"][1]
 head(top_feature)
 # Extract factor scores
 factors <- get_factors(mofa_trained, factors = 1, as.data.frame = TRUE)
+
+# Extract feature expression
+data <- get_data(mofa_trained, view = "RNAseq", as.data.frame = TRUE)
+feature_data <- subset(data, as.character(feature) == as.character(top_feature))
+
+# Merge data
+df <- merge(factors, feature_data, by = "sample")
+df$group <- samples_metadata(mofa_trained)$group
+
+# Plot 
+ggplot(df, aes(x = value.x, y = value.y, color = group)) +
+  geom_point(size = 3) +
+  geom_smooth(method = "lm", se = FALSE) +
+  stat_cor(method = "pearson") +
+  labs(
+    x = "Factor 1 score",
+    y = paste("Expression of", top_feature)
+  ) +
+  theme_minimal()
+
+
+
+```
+
+```{r factor-feature-correlation}
+#######  Gene correlates with factor 1 component ###############################
+
+# Extract weights
+weights <- get_weights(mofa_trained, views = "RNAseq", factors = 2, as.data.frame = TRUE)
+#These weights represent how strongly each feature contributes to Factor 1
+
+top_genes <- get_weights(mofa_trained, 
+                         view = "RNAseq", 
+                         factor = 2, 
+                         as.data.frame = TRUE)
+
+top_feature <- top_genes[order(abs(top_genes$value), decreasing = TRUE), ]
+top_feature <- weights[order(-abs(weights$value)), "feature"][1]
+head(top_feature)
+# Extract factor scores
+factors <- get_factors(mofa_trained, factors = 2, as.data.frame = TRUE)
 
 # Extract feature expression
 data <- get_data(mofa_trained, view = "RNAseq", as.data.frame = TRUE)
