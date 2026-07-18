@@ -1,0 +1,641 @@
+---
+title: "Multi-Omics Integration Analysis - DIABLO"
+author: "Adam El Idrissi"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+# Practical overview
+
+This R Markdown document preserves the workflow and execution order of the supplied `MixOmics.R` script. This markdown contains all the detailed description regarding the code cells and the output results, relatively to the data subset utilized. It is worth taking a look on the process of the data integration using DIABLO approach, with its alternative tutorial being explained in `https://mixomics.org/mixdiablo/diablo-tcga-case-study/`. We have approached this data fusion framework "DIABLO" as one of the most utilized supervised approach for data integration.
+
+------------------------------------------------------------------------
+
+# 1. Package installation and loading
+
+Packages are installed from both CRAN and Bioconductor repositories. `mixOmics` is the main package used for multi-omics integration, as it supports the integration of multiple omics datasets through methods such as `DIABLO`, which will be used throughout this tutorial. `BiocParallel` is used for parallel computing, allowing the analysis to run faster, particularly during model tuning and performance evaluation, which can require considerable computation time. It is generally recommended to allocate approximately (the total number of available CPU cores − 2) workers to maximize performance while leaving enough resources for the operating system. `tidyverse`, `dplyr`, and their associated packages are used for data manipulation and dataframe handling. Finally, `reshape2`, `edgeR`, and `limma` provide functions for processing and preparing the RNA-seq and methylation datasets prior to multi-omics integration.
+
+```{r package-loading}
+######## MUlti Omics Integration analysis ######################################
+#BiocManager::install("mixOmics")
+library(BiocParallel)
+library(mixOmics)
+library(tidyverse)
+library(GEOquery)
+library(dplyr)
+library(pheatmap)
+library(caret)
+library(RColorBrewer)
+library(reshape2)
+library(igraph)
+library(edgeR)
+library(limma)
+
+cores <- MulticoreParam(workers = 18)
+```
+
+------------------------------------------------------------------------
+
+# 2. Load expression and methylation data
+
+Boar taint is one of the most extensively studied phenotypes in swine production. It is characterized by an unpleasant urine- or feces-like odor and flavour that is released during the cooking of meat from uncastrated male pigs. Based on the intensity of this phenotype, the animals included in this study were classified into three groups: Low, Medium, and High boar taint.
+
+Our two datasets originate from the 3 groups of boars, differentiated by their taints (Low - Medium - High taint), where one dataset contains Testies RNA-seq measurements and the other contains Methylation measurements. The RNA matrix consists of 25,322 genes measured across 9 boars (3 from each phenotypes), whereas the methylation matrix contains 100,000 methylation observations measured from the same 9 boars (3 from each phenotypes). For vertical integration using the DIABLO framework, it is essential that the same biological samples are shared across all omics modalities. In our case, the nine boars were profiled at different molecular levels, allowing the integration of transcriptomic and methylation information from the same individuals. The data are organized in the required format, where rows correspond to molecular features (genes or methylation sites) and columns correspond to the individual samples. Later in the workflow, these matrices are transposed into the format required by DIABLO, where rows represent the individual observations (samples) and columns represent the variables (molecular features).
+
+```{r data-import}
+#### Load the Expression data nd methylation data 
+rna_matrix=read.csv("RNA_Seq_Testis.csv")
+rna_matrix$X=NULL
+rownames(rna_matrix)=rna_matrix$GeneID
+rna_matrix$GeneID=NULL
+head(rna_matrix)
+
+meth_matrix_filtered =read.csv("Epigenetic_matrix_filtered_100000.csv")
+rownames(meth_matrix_filtered)=meth_matrix_filtered$region
+meth_matrix_filtered$X=NULL
+meth_matrix_filtered$X.1=NULL
+meth_matrix_filtered$region=NULL
+head(meth_matrix_filtered)
+```
+
+------------------------------------------------------------------------
+
+# 3. Load metadata and align sample identifiers
+
+The metadata file contains the identifiers of each boar together with its corresponding boar taint phenotype (Low, Medium, or High). In this step, the metadata are prepared to be compatible with the DIABLO integration framework. One important concept during multi-omics integration is `column alignment`. This means that the order of the samples must be identical across every omics dataset to be integrated. For example, if Dataset A contains the sample order ID1, ID2, ID3, then Dataset B and Dataset C must follow the exact same order (ID1, ID2, ID3). Any mismatch in the sample ordering would result in the integration of measurements would result potential results biasm as the matrices do not observe the row.names and col.names information.
+
+```{r metadata-loading-filtering}
+## Loading Metadata and Filtering ##############################################
+
+metadat_columns =read.csv("metadata.csv")
+head(metadat_columns)
+metadat_columns$X=NULL
+metadat_columns=data.frame(metadat_columns)
+
+# Add prefix based on boar taint group
+metadat_columns$SampleName <- ifelse(
+  grepl("high", metadat_columns$Group, ignore.case = TRUE), 
+  paste0("H", metadat_columns$SampleID),
+  ifelse(
+    grepl("medium", metadat_columns$Group, ignore.case = TRUE), 
+    paste0("M", metadat_columns$SampleID),
+    ifelse(
+      grepl("low", metadat_columns$Group, ignore.case = TRUE), 
+      paste0("L", metadat_columns$SampleID),
+      paste0("X", metadat_columns$SampleID)  # fallback if none match
+    )
+  )
+)
+
+metadat_columns$Group <- sub(" .*", "", metadat_columns$Group)
+
+# Create the old and new column name mapping
+metadat_columns$OldSampleName <- paste0("X", metadat_columns$SampleID)  # Original names
+name_map <- setNames(metadat_columns$SampleName, metadat_columns$OldSampleName)  # Named vector: old -> new
+
+# Rename methylation matrix columns
+common_meth_cols <- intersect(colnames(meth_matrix_filtered), names(name_map))
+colnames(meth_matrix_filtered)[match(common_meth_cols, colnames(meth_matrix_filtered))] <- name_map[common_meth_cols]
+
+# Rename RNA-seq matrix columns
+common_rna_cols <- intersect(colnames(rna_matrix), names(name_map))
+colnames(rna_matrix)[match(common_rna_cols, colnames(rna_matrix))] <- name_map[common_rna_cols]
+
+# Update metadata rownames to match new names
+rownames(metadat_columns) <- metadat_columns$SampleName
+
+
+# Filter metadata to keep only samples present in omics data
+omics_samples <- colnames(meth_matrix_filtered)  
+sample_metadata <- metadat_columns[metadat_columns$SampleName %in% omics_samples, ]
+
+# Double-check that sample orders match
+all(colnames(rna_matrix) == colnames(meth_matrix_filtered))
+# Reorder columns of methylation matrix to match RNA-seq
+meth_matrix <- meth_matrix_filtered[, colnames(rna_matrix)]
+####### Check that they're now aligned
+all(colnames(meth_matrix) == colnames(rna_matrix))  # should return TRUE
+```
+
+------------------------------------------------------------------------
+
+# 4. Normalize the RNA-seq data
+
+Before integrating the transcriptomic data with any other data modality, the RNA-seq counts must be normalized to create a stable distribution. The raw count matrix are initially pre-processed by removing lowly expressed genes using `filterByExpr()`. Normalization factors are then estimated with `calcNormFactors()` for batch to batch estimation and false positive/negative results, and the counts are transformed into log<sub>2</sub> Counts Per Million (CPM) values using a prior count to avoid undefined values produced by log(0) (mathematically undefined real number). The final processed RNA-seq data leaves with 9 boars and 10546
+
+```{r rna-normalization}
+###### Normalize the data
+dge <- DGEList(counts = rna_matrix)
+keep <- filterByExpr(dge)
+dge <- dge[keep, , keep.lib.sizes = FALSE]
+dge <- calcNormFactors(dge)
+# Log2 CPM transformation with prior count to avoid log(0)
+rna_matrix <- cpm(dge, log = TRUE, prior.count = 1)
+dim(rna_matrix)
+```
+
+------------------------------------------------------------------------
+
+# 5. Filter and transform the methylation data
+
+Before integrating the methylation data with any other data modalities, in the same process of RNA-seq, methylation data is subject to pre-processing. The data are first converted into a numeric matrix, after which the methylation β-values are transformed into M-values using a logit transformatiion. This transformation is presented as log2 ratio transformation of the intensities methylated probes vs unmethylated probes. The reference of this transformation is in the following paper `https://pmc.ncbi.nlm.nih.gov/articles/PMC3012676/`. To improve data quality, methylation sites with more than 20% missing values are removed, and samples exceeding the same missingness threshold are also excluded. The final outcome of the methylation dataset is 18675 methylated regions in 9 candidate boars.
+
+```{r methylation-filtering}
+####### Filter Methylation data
+# Convert data frame to numeric matrix
+meth_matrix <- as.matrix(meth_matrix)
+storage.mode(meth_matrix) <- "numeric"  # make sure all values are numeric
+# Convert to M-values
+meth_matrix <- log2(meth_matrix / (1 - meth_matrix))
+meth_matrix[is.infinite(meth_matrix)] <- NA
+# keep features with <20% NA
+meth_matrix <- meth_matrix[apply(meth_matrix, 1, function(x) sum(is.na(x)) < length(x) * 0.2), ]  
+meth_matrix <- meth_matrix[, colSums(is.na(meth_matrix)) < nrow(meth_matrix) * 0.2]
+
+dim(meth_matrix)
+```
+
+------------------------------------------------------------------------
+
+# 6. Prepare the data blocks for DIABLO
+
+Before fitting the DIABLO model, both omics datasets must be organized into the format required by the integration framework. The phenotypic information is first extracted from the metadata and converted into a categorical response variable (Y), representing the three boar taint groups (Low, Medium, and High). The normalized RNA-seq and filtered methylation datasets are then combined into a list of omics blocks, where each block corresponds to one molecular modality.
+
+A design matrix is subsequently defined to specify the relationships between the omics datasets during integration. In this study, a full design is adopted, allowing both RNA-seq and methylation data to contribute equally to the construction of the latent components. For a given example of 3 data modalities, the value of equal contribution will be set to 0.5.
+
+The number of latent components (ncomp) is initially set to five, while the number of variables retained from each omics block (keepX) is fixed at 50 features per component. These parameters provide an initial model that will later be optimized through cross-validation. Finally, both omics matrices are transposed into the format required by DIABLO, where rows correspond to biological samples and columns correspond to omics variables.
+
+```{r diablo-data-preparation}
+# Set sample group (outcome variable) from metadata
+Y <- as.factor(sample_metadata$Group)  
+names(Y) <- sample_metadata$SampleName
+
+# Combine omics into a list
+omics_list <- list(
+  RNA = rna_matrix,
+  Meth = meth_matrix
+)
+
+# Check dimensions
+lapply(omics_list, dim)
+
+# Full design = all data blocks contribute to the response
+design <- matrix(1, ncol = length(omics_list), nrow = length(omics_list))
+diag(design) <- 0
+colnames(design) <- rownames(design) <- names(omics_list)
+design
+
+
+# Set number of components 
+ncomp <- 5
+
+
+# Set number of variables to keep from each omics block per component
+list.keepX <- list(
+  RNA = rep(50, ncomp),       # top 50 genes per component
+  Meth = rep(50, ncomp)       # top 50 CpG per component
+)
+
+# Convert omics_list to proper DIABLO format
+omics_list_fixed <- lapply(omics_list, function(df) {
+  mat <- as.matrix(df)
+  mat <- t(mat)                  # Transpose: samples as rows, features as columns
+  storage.mode(mat) <- "numeric" # Ensure matrix is numeric
+  return(mat)
+})
+
+
+########################
+# Check shape
+str(omics_list_fixed)
+```
+
+------------------------------------------------------------------------
+
+# 7. Fit the first DIABLO model
+
+This step establishes the first DIABLO model by integrating the two omics datasets with the boar taint phenotype. The model is initially built using five latent components, with the top 50 variables retained from each omics block for every component. The previously defined full design matrix is used, allowing both omics datasets to contribute equally to the construction of the latent components. This initial model serves as the foundation for the subsequent tuning, performance evaluation, and downstream analyses.
+
+```{r diablo-model}
+# Run DIABLO
+diablo_model <- block.splsda(
+  X = omics_list_fixed,
+  Y = Y,
+  ncomp = ncomp,
+  keepX = list.keepX,
+  design = design 
+)
+```
+
+------------------------------------------------------------------------
+
+# 8. Tune the number of components
+
+The initial DIABLO model is subsequently evaluated to determine the optimal number of latent components required to discriminate between the boar taint phenotypes. This optimization is performed using Leave-One-Out validation method, as our data contains very few observation, repeated 10 times. DIABLO supports the paralellization frameworkm to allow the previously defined CPU cores to accelerate the repeated validation method. Note that, when dealing with abundant observations, consider using the `Mfold` validation approach, and include the number of folds using the argument `folds = number_of_folds`. (3,5,10 folds) Given the limitation of the current dataset, the optimal approach is to set the validation using the jacknife method `loo`.
+
+The resulting performance plot illustrates how the prediction error changes as the number of components increases. Note that our datasets have limitation in terms of observation, which the models does fail at minimizing the error from `comp 2 and higher`. The best metric to evaluate is the centroids.dist, in order to keep the most significant informative components throughout the model tuning. Finally, the optimal number of components (ncomp) is selected as the one producing the lowest Overall Balanced Error Rate according to the Weighted Vote classification using the centroids distance metric. As the value is set to `ncomp = 1`, we will choose the first two components to finalize the DIABLO model.
+
+```{r component-tuning}
+# run component number tuning with repeated CV
+perf.diablo = perf(diablo_model, validation = 'loo',
+                   nrepeat = 10, BPPARAM = cores, progressBar = TRUE) 
+
+plot(perf.diablo) # plot output of tuning
+
+# set the optimal ncomp value
+ncomp = perf.diablo$choice.ncomp$WeightedVote["Overall.BER", "centroids.dist"] +1 # Reason is due to one comp 1 is not working for plotting purposes
+# show the optimal choice for ncomp for each dist metric
+perf.diablo$choice.ncomp$WeightedVote 
+perf.diablo$choice.ncomp$MajorityVote
+
+list.keepX <- list(
+  RNA = rep(50, ncomp),       # top 50 genes per component
+  Meth = rep(50, ncomp)       # top 50 CpG per component
+)
+
+diablo_model = block.splsda(X = omics_list_fixed, Y = Y, ncomp = ncomp, 
+                                  keepX = list.keepX, design = design)
+
+```
+
+------------------------------------------------------------------------
+
+# 9. Downstream analysis
+
+# 9.1 Sample projections
+
+Throughout the tuning procedure, we selected two components, then we plotted the individuals to observe how they cluster according to their omics measurements. As observed, both the RNA-seq and methylation plots stratify the subjects into three distinct regions. In both datasets, Component 1 separates the Medium boar taint group from the Low and High groups. As the second component was not a recommendation from the model, it is better to leave the interpretation aside.
+
+```{r plot-individuals}
+############ Downstream analysis ###############################################
+
+# Plot sample projections on the first two components from DIABLO
+ragg::agg_png(filename = "plot_indiv.png", width = 2400, height = 1400, units = "px", res = 300, background = "white")
+plotIndiv(diablo_model, group = Y, legend = TRUE,alpha = 1)
+dev.off()
+```
+
+------------------------------------------------------------------------
+
+# 9.2 Methylation and RNA loading plot
+
+We have plotted the variables with the highest contribution from the methylation dataset, where each variable contributes to the differentiation of the sample groups along latent component 1. In other words, each bar represents the contribution of a methylation feature, while its colour indicates the phenotype that primarily drives its discriminatory effect. The same interpretation applies to the RNA-seq modality, where the highest contributing genes are displayed according to their association with the different boar taint phenotypes
+
+```{r plot-loadings-methylation}
+# Features with maximum contribution are highlighted using the 'median' method
+ragg::agg_png(filename = "plot_loading_methylation.png", width = 3200, height = 1800, units = "px", res = 300, background = "white")
+plotLoadings(diablo_model, comp = 1, block = "Meth", contrib = 'max', method = 'median', size.legend = 1,border = T)
+dev.off()
+
+ragg::agg_png(filename = "plot_loading_RNA.png", width = 3200, height = 1800, units = "px", res = 300, background = "white")
+plotLoadings(diablo_model, comp = 1, block = "RNA", contrib = 'max', method = 'median', size.legend = 0.5,border = T)
+dev.off()
+
+```
+
+------------------------------------------------------------------------
+
+# 9.3 Extract selected variables
+
+To extract the most significant biomarkers observed for each matrix block, we use `selectvar()` to extract the significance of each variable, from the final DIABLO model.
+
+```{r selected-variables}
+# This gives a vector of methylation features selected by DIABLO - TOP 50
+selectVar(diablo_model, block = "Meth", comp = 1) -> var1; var1
+dim(var1$Meth$value)
+selectVar(diablo_model, block = "RNA", comp = 1) -> var1; var1
+dim(var1$RNA$value)
+```
+
+------------------------------------------------------------------------
+
+# 9.4 Correlation-circle variable plot
+
+The correlation circle plot visualizes the relationships among the previously selected variables from both modalities. As our objective is to focus on the `comp=1`, each point represents a molecular feature projected onto the first latent component, where the distance from the center reflects its contribution to the model. Each colour represent the matrix block data, where orange and blue represents respectively Methylome and Transcriptome modalities. A cutoff of the first circle is set at `0.7`, indicating the points observed between `abs(0.7 - 1)` are the highly correlated variables. Variables located close to one another are positively correlated, whereas variables positioned in opposite directions are negatively correlated.
+
+```{r plot-variables}
+# Visualize correlations among selected variables across all blocks
+# Helpful for understanding relationships between RNA and Methylation features
+ragg::agg_png(filename = "plot_var_correlation.png", width = 3200, height = 1800, units = "px", res = 300, background = "white")
+plotVar(diablo_model, var.names = F,rad.in = 0.7, legend = T )
+dev.off()
+```
+
+------------------------------------------------------------------------
+
+# 9.5 Generate the DIABLO clustered image map
+
+The clustered heatmap displays the RNA and methylation features selected on component 1 across the nine boars. The samples cluster according to their molecular profiles, with the three Medium individuals forming a distinct group, while the Low and High samples show more similar patterns. The columns also group selected RNA and methylation variables with comparable expression or methylation profiles. The individual differentiations between the Medium taint vs the Low and High matches with the results observed in `plotIndiv()`. Similarly, we are able to differentiate between the correlations observed among the data blocks and the sample groups.
+
+```{r cim-diablo}
+###### Run this chunk for the Heatmap of selected features from a DIABLO
+### expression or methylation values
+colours = color.GreenRed(50, alpha = 1)
+pdf("cim_diablo_heatmap.pdf", width = 10, height = 10)
+cim_res <- cimDiablo(diablo_model, comp = 1, color = colours)
+dev.off()
+
+summary(cim_res)
+dim(cim_res$mat)
+head(rownames(cim_res$mat))
+head(colnames(cim_res$mat))
+```
+
+------------------------------------------------------------------------
+
+# 9.6 Prepare heatmap annotations
+
+This plot provides another representation of the selected variables, with clearer annotation of the feature names correlated with the phenotype outcomes.
+
+```{r heatmap-annotations}
+# Map row.sideColors to labels
+row_color_to_label <- c("#388ECC" = "High", "#C2C2C2" = "Medium", "#F68B33" = "Low")
+row_labels <- row_color_to_label[cim_res$row.sideColors]
+
+row_annotation <- data.frame(Phenotypes = factor(row_labels, levels = c("Low", "Medium", "High")))
+rownames(row_annotation) <- cim_res$row.names
+
+# Map col.sideColors to labels
+col_color_to_label <- c("#1F78B4" = "RNA", "#33A02C" = "Meth")
+col_labels <- col_color_to_label[cim_res$col.sideColors]
+
+col_annotation <- data.frame(Block = factor(col_labels, levels = c("RNA", "Meth")))
+rownames(col_annotation) <- cim_res$col.names
+
+annotation_colors <- list(
+  Block = c(
+    RNA = "#1F78B4",
+    Meth = "#33A02C"
+  ), Phenotypes = c(High = "#388ECC", Medium = "#C2C2C2", Low = "#F68B33")
+)
+
+# There are 2 blocks RNA and Meth in columns, with feature IDS in the x-axis. There are 9 BT samples labelled with prefix "H", "M", and "L" in rows.
+#The scale going from -2 to +2 is effect sizes (estimated weights from the model) estimated from DIABLO ML model (penalized regression or LASSO) with two blocks and features as covariates. 
+ragg::agg_png(filename = "plot_cim_pheatmap_new.png", width = 3200, height = 2400, units = "px", res = 300, background = "white")
+pheatmap(cim_res$mat,
+         cluster_rows = F,
+         cluster_cols = T,
+         show_rownames = TRUE,
+         show_colnames = TRUE,
+         annotation_row = row_annotation,
+         annotation_col = col_annotation,
+         annotation_colors = annotation_colors,
+         color = colorRampPalette(c("blue", "white", "red"))(50),
+         main = "DIABLO CIM Heatmap - Component 1",
+         fontsize_col = 2,     # column names font size
+         fontsize_row = 10,     # row names font size
+         fontsize = 10)         # general font size for heatmap
+dev.off()
+
+```
+
+------------------------------------------------------------------------
+
+# 9.7 Sample-arrow plot
+
+In the arrow plot below, the starting point of each arrow represents the consensus position of a given boar across the RNA and methylation datasets, while the arrow tips indicate its block-specific position in each omics dataset. Each point represent the sample observed from an omic dataset, represented by the legend color, and the arrow tip This visualization therefore highlights the agreement between the two data blocks at the individual-sample level. Shorter arrows indicate stronger agreement between RNA and methylation measurements, whereas longer arrows indicate greater disagreement between the omics-specific representations of the same sample.
+
+```{r plot-arrows}
+# Plot sample projections and agreement between omics blocks
+# Arrows show how each sample's omics-specific and consensus positions differ
+ragg::agg_png(filename = "plot_arrow.png", width = 3200, height = 1800, units = "px", res = 300, background = "white")
+plotArrow(
+  diablo_model,
+  ind.names = TRUE,
+  legend = TRUE,
+  title = "DIABLO - Sample Arrows",
+  cex = 0.9,  # Adjust label size
+  pch.size = 3.5
+  )
+dev.off()
+```
+
+------------------------------------------------------------------------
+
+# 9.8 Circos plot
+
+The circos plot represents the strongest correlations between the selected RNA and methylation variables on component 1, with the two omics blocks displayed on opposite sides of the circle. Red links indicate positive correlations, whereas blue links indicate negative correlations. The result is matching and summarizing all the previous heatmaps, loading contributions and correlation circle plots. In this plot, both positive and negative relationships are observed between the RNA and methylation features. The outer profiles show the relative expression or methylation patterns associated with the High, Low, and Medium phenotype groups. Only correlations with an absolute value above the selected threshold of 0.85 are displayed, so the interpretation is restricted to very strongly correlated features.
+
+```{r plot-circos}
+# Generate a circos plot from the DIABLO model to visualize correlations between features
+ragg::agg_png(filename = "plot_circos.png", width = 3200, height = 1800, units = "px", res = 300, background = "white")
+circosPlot(diablo_model, comp = 1, line = TRUE, cutoff = 0.85)   ### Its good 
+dev.off()
+```
+
+------------------------------------------------------------------------
+
+# 9.9.a Extract high-correlation RNA–methylation pairs
+
+In this step, we will be extracting the pairs of omics information that seem to be correlated, with a cutoff higher than the absolute value of 0.85.
+
+```{r correlation-extraction}
+# Extract correlation matrix between RNA and Meth blocks, comp = 1
+# Get the selected variables
+rna_loadings <- diablo_model$loadings$RNA[, 1]
+meth_loadings <- diablo_model$loadings$Meth[, 1]
+
+# Set a loading threshold (e.g., abs > 0.1)
+# Filter based on loadings (optional, or use all features)
+top_rna <- names(rna_loadings[abs(rna_loadings) > 0.1])
+top_meth <- names(meth_loadings[abs(meth_loadings) > 0.1])
+
+# Subset expression and methylation matrices
+rna_mat <- diablo_model$X$RNA[, top_rna, drop = FALSE]
+meth_mat <- diablo_model$X$Meth[, top_meth, drop = FALSE]
+
+# Compute pairwise correlations
+cor_matrix <- cor(rna_mat, meth_mat, use = "pairwise.complete.obs") #This builds a correlation matrix of RNA–meth relationships.
+
+# Flatten the correlation matrix into long format
+cor_long <- melt(cor_matrix, varnames = c("RNA", "Meth"), value.name = "correlation")
+
+# Filter based on desired correlation cutoff
+high_cor <- subset(cor_long, abs(correlation) >= 0.85)
+
+# Sort by correlation strength
+high_cor <- high_cor[order(-abs(high_cor$correlation)), ]
+
+# Get matrix of high-correlation features only
+heat_cor_mat <- cor_matrix[unique(high_cor$RNA), unique(high_cor$Meth)]
+
+my_palette <- colorRampPalette(rev(brewer.pal(n = 11, name = "RdBu")))(1000)
+
+# Create the heatmap
+
+heat_cor_mat <- as.matrix(heat_cor_mat) 
+```
+
+------------------------------------------------------------------------
+
+# 9.9.b Correlation heatmap
+
+After selecting the top variables that contributed to the first component, we have plotted them respectively to their high correlation value. This heatmap clearly indicates clusters of biomarkers that are negatively / positively correlated. An evaluation of these biomarkers are recommended at the genomic location for a better causality interpretation.
+
+```{r correlation-heatmap}
+ragg::agg_png(filename = "plot_correlation_top_loadings.png", width = 3200, height = 2400, units = "px", res = 300, background = "white")
+pheatmap::pheatmap(
+  heat_cor_mat,
+  color = my_palette,
+  cluster_rows = TRUE,
+  cluster_cols = TRUE,
+  show_rownames = TRUE,
+  show_colnames = TRUE,
+  fontsize = 10,
+  fontsize_row = 9,
+  fontsize_col = 9,
+  cellwidth = 18,
+  cellheight = 11,
+  main = "High-Correlation RNA–Methylation Pairs",
+  border_color = "grey80",
+  legend_breaks = c(-1, -0.85, 0.85, 1),
+  legend_labels = c("-1", "-0.85", "0.85", "1"),
+  legend = TRUE
+)
+dev.off()
+```
+
+------------------------------------------------------------------------
+
+# 9.10 RNA–methylation correlation network
+
+The correlation network represents the strong associations identified between the selected RNA and methylation features. RNA variables are shown in red, while methylation sites are shown in blue, and each edge represents a correlation between the two omics blocks. The network contains 154 RNA–methylation pairs with correlations above 0.85, highlighting highly connected features that may contribute jointly to the separation of the boar taint phenotypes. The network can also be exported in `graphml` format for further exploration in `Cytoscape`.
+
+```{r correlation-network}
+##### Network analysis of the genes and CPGs
+# Create edges from gene–Meth pairs
+edges <- data.frame(
+  from = high_cor$RNA,
+  to = high_cor$Meth,
+  weight = high_cor$correlation
+)
+
+# Create graph from edge list
+g <- graph_from_data_frame(edges, directed = FALSE)
+
+# Define node types correctly (RNA vs Meth)
+V(g)$type <- ifelse(V(g)$name %in% high_cor$RNA, "RNA", "Meth")
+
+# Assign colors based on node type
+V(g)$color <- ifelse(V(g)$type == "RNA", "tomato", "skyblue")  # tomato for RNA, skyblue for Meth
+
+# Use absolute correlation values as edge weights
+E(g)$weight <- abs(E(g)$weight)
+
+# Plot the graph with weighted edges and node color based on type
+ragg::agg_png(filename = "plot_correlation_network.png", width = 3200, height = 1800, units = "px", res = 300, background = "white")
+plot(g,
+     vertex.label.cex = 0.6,
+     vertex.label.color = "black",
+     vertex.size = 6,
+     edge.width = E(g)$weight * 1,
+     vertex.frame.color = "gray40",
+     main = "Correlation Network: RNA ↔ Methylation Features")
+dev.off()
+
+dim(high_cor[high_cor$correlation > 0.85,]) # 154 pairwise comparison
+
+#### Save the networks info for the Cytosacpe 
+write_graph(g, file = "gene_methylation_network.graphml", format = "graphml")
+
+```
+
+------------------------------------------------------------------------
+
+# 10. Performance evaluation
+
+The predictive performance of the DIABLO model was evaluated using the previously computed using `leave-one-out method`, and ROC analyses for the RNA and methylation blocks. For the methylation block, component 1 showed perfect discrimination for the Medium group, with an AUC of 1.00, while the Low and High groups reached AUC values of 0.7778 and 0.7222, respectively. These results should be interpreted cautiously because the dataset contains only nine observations, with three individuals per phenotype group. In the same way, the observation on the RNA block also resulted a perfect discrimination of the Medium group, while the rest have lower value. Subsequently, this small sample size strongly limits the stability and generalizability of the estimated AUC values and may lead to overly bias interpretation. In general, multiomics integration requires quite numerous observation to overcome the curse of dimensionality.
+
+```{r performance-evaluation}
+###############################################################################################################################################
+
+# run repeated CV performance evaluation
+perf.diablo 
+
+perf.diablo$MajorityVote.error.rate
+perf.diablo$WeightedVote.error.rate
+
+ragg::agg_png(filename = "plot_AUC_RNA.png", width = 3200, height = 1800, units = "px", res = 300, background = "white")
+auc.splsda = auroc(diablo_model, roc.block = "RNA", 
+                   roc.comp = 1, print = TRUE, plot = TRUE)
+dev.off()
+
+ragg::agg_png(filename = "plot_AUC_Meth.png", width = 3200, height = 1800, units = "px", res = 300, background = "white")
+auc.splsda = auroc(diablo_model, roc.block = "Meth", 
+                   roc.comp = 1, print = TRUE, plot = TRUE)
+dev.off()
+
+```
+
+------------------------------------------------------------------------
+
+# 11. Optional top-feature network analysis
+
+The following code was commented out in the supplied script and remains commented out here.
+
+```{r optional-top-feature-network}
+# ############## Only on Top features Network analysis  ##########################
+# 
+# Extract loadings
+load_rna  <- diablo_model$loadings$RNA[, 1]
+load_meth <- diablo_model$loadings$Meth[, 1]
+
+# Select top 10 features based on absolute loading
+top_rna <- names(sort(abs(load_rna), decreasing = TRUE))[1:10]
+top_meth <- names(sort(abs(load_meth), decreasing = TRUE))[1:10]
+
+# Subset omics data to top 10 features
+omics_top <- list(RNA = omics_list_fixed$RNA[, top_rna],
+                  Meth = omics_list_fixed$Meth[, top_meth])
+
+diablo_small <- block.splsda(
+  X = omics_top,
+  Y = Y,
+  ncomp = 1,
+  # only 1 component needed for network
+  keepX = list(RNA = 10, Meth = 10),
+  design = matrix(c(0, 1, 1, 0), ncol = 2)  # simple design
+)
+
+ragg::agg_png(
+  filename = "plot_small_network.png",
+  width = 3200,
+  height = 1800,
+  units = "px",
+  res = 300,
+  background = "white"
+)
+
+network_graph <- network(
+  diablo_small,
+  comp = list(RNA = 1, Meth = 1),
+  blocks = c("RNA", "Meth"),
+  color.node = c("tomato", "skyblue"),
+  shape.node = c("circle", "rectangle"),
+  cutoff = 0.3,
+  save = "jpeg"
+)
+
+igraph::V(network_graph)$label.family <- "sans"
+
+plot(
+  network_graph,
+  vertex.label.family = "sans"
+)
+
+dev.off()
+
+
+```
+
+------------------------------------------------------------------------
+
+# 12. Acknowledgement
+
+Special thanks to the PhD student Pratik Pandurang for sharing the original data, and some parts of the script. Major changes in the script was done by Adam El Idrissi. Special thanks to the core team of Mixomics for building this amazing integration software.
+
+For any further questions, feel free to contact me in the following contacts: Email: [adam.elidrissi\@unicatt.it](mailto:adam.elidrissi@unicatt.it){.email} - [tnewnis2\@gmail.com](mailto:tnewnis2@gmail.com){.email}
